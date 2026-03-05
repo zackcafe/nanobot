@@ -576,18 +576,26 @@ class FeishuChannel(BaseChannel):
         elif msg_type in ("audio", "file", "media"):
             file_key = content_json.get("file_key")
             if file_key and message_id:
+                # Map msg_type to correct resource_type for Feishu API
+                # audio messages should use "file" as resource_type
+                resource_type = "file" if msg_type == "audio" else msg_type
                 data, filename = await loop.run_in_executor(
-                    None, self._download_file_sync, message_id, file_key, msg_type
+                    None, self._download_file_sync, message_id, file_key, resource_type
                 )
                 if not filename:
                     ext = {"audio": ".opus", "media": ".mp4"}.get(msg_type, "")
                     filename = f"{file_key[:16]}{ext}"
+                else:
+                    # Ensure audio files have proper extension
+                    if msg_type == "audio" and not filename.endswith(('.opus', '.mp3', '.wav', '.m4a', '.amr')):
+                        filename = f"{filename}.opus"
 
         if data and filename:
             file_path = media_dir / filename
             file_path.write_bytes(data)
             logger.debug("Downloaded {} to {}", msg_type, file_path)
-            return str(file_path), f"[{msg_type}: {filename}]"
+            # Return full path in content for tools to use
+            return str(file_path), f"[{msg_type}: {file_path}]"
 
         return None, f"[{msg_type}: download failed]"
 
