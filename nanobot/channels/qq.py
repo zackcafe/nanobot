@@ -1,12 +1,9 @@
 """QQ channel implementation using botpy SDK."""
 
 import asyncio
-import hashlib
 from collections import deque
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-import httpx
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
@@ -16,16 +13,17 @@ from nanobot.config.schema import QQConfig
 
 try:
     import botpy
-    from botpy.message import C2CMessage
+    from botpy.message import C2CMessage, GroupMessage
 
     QQ_AVAILABLE = True
 except ImportError:
     QQ_AVAILABLE = False
     botpy = None
     C2CMessage = None
+    GroupMessage = None
 
 if TYPE_CHECKING:
-    from botpy.message import C2CMessage
+    from botpy.message import C2CMessage, GroupMessage
 
 
 def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
@@ -41,10 +39,13 @@ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
             logger.info("QQ bot ready: {}", self.robot.name)
 
         async def on_c2c_message_create(self, message: "C2CMessage"):
-            await channel._on_message(message)
+            await channel._on_message(message, is_group=False)
+
+        async def on_group_at_message_create(self, message: "GroupMessage"):
+            await channel._on_message(message, is_group=True)
 
         async def on_direct_message_create(self, message):
-            await channel._on_message(message)
+            await channel._on_message(message, is_group=False)
 
     return _Bot
 
@@ -53,14 +54,15 @@ class QQChannel(BaseChannel):
     """QQ channel using botpy SDK with WebSocket connection."""
 
     name = "qq"
+    display_name = "QQ"
 
-    def __init__(self, config: QQConfig, bus: MessageBus, groq_api_key: str = ""):
+    def __init__(self, config: QQConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: QQConfig = config
-        self.groq_api_key = groq_api_key
         self._client: "botpy.Client | None" = None
         self._processed_ids: deque = deque(maxlen=1000)
-        self._msg_seq_counter: dict[str, int] = {}  # Track msg_seq for each msg_id
+        self._msg_seq: int = 1  # 消息序列号，避免被 QQ API 去重
+        self._chat_type_cache: dict[str, str] = {}
 
     async def start(self) -> None:
         """Start the QQ bot."""
@@ -75,8 +77,7 @@ class QQChannel(BaseChannel):
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
-
-        logger.info("QQ bot started (C2C private message)")
+        logger.info("QQ bot started (C2C & Group supported)")
         await self._run_bot()
 
     async def _run_bot(self) -> None:
@@ -105,33 +106,31 @@ class QQChannel(BaseChannel):
         if not self._client:
             logger.warning("QQ client not initialized")
             return
+
         try:
-            # Use msg_id from received message for passive reply
             msg_id = msg.metadata.get("message_id")
-
-            if msg_id:
-                # Increment msg_seq for this msg_id to avoid deduplication
-                self._msg_seq_counter[msg_id] = self._msg_seq_counter.get(msg_id, 0) + 1
-                msg_seq = self._msg_seq_counter[msg_id]
-
-                await self._client.api.post_c2c_message(
-                    openid=msg.chat_id,
-                    msg_type=0,
-                    content=msg.content,
+            self._msg_seq += 1
+            msg_type = self._chat_type_cache.get(msg.chat_id, "c2c")
+            if msg_type == "group":
+                await self._client.api.post_group_message(
+                    group_openid=msg.chat_id,
+                    msg_type=2,
+                    markdown={"content": msg.content},
                     msg_id=msg_id,
-                    msg_seq=msg_seq,
+                    msg_seq=self._msg_seq,
                 )
             else:
-                # Active message without msg_id
                 await self._client.api.post_c2c_message(
                     openid=msg.chat_id,
-                    msg_type=0,
-                    content=msg.content,
+                    msg_type=2,
+                    markdown={"content": msg.content},
+                    msg_id=msg_id,
+                    msg_seq=self._msg_seq,
                 )
         except Exception as e:
             logger.error("Error sending QQ message: {}", e)
 
-    async def _on_message(self, data: "C2CMessage") -> None:
+    async def _on_message(self, data: "C2CMessage | GroupMessage", is_group: bool = False) -> None:
         """Handle incoming message from QQ."""
         try:
             # Dedup by message ID
@@ -139,116 +138,24 @@ class QQChannel(BaseChannel):
                 return
             self._processed_ids.append(data.id)
 
-            author = data.author
-            user_id = str(getattr(author, 'id', None) or getattr(author, 'user_openid', 'unknown'))
             content = (data.content or "").strip()
-
-            # Check for attachments (images, voice, etc.)
-            attachments = getattr(data, 'attachments', None)
-            media_paths = []
-
-            # Download and process media attachments
-            if attachments:
-                media_dir = Path.home() / ".nanobot" / "media"
-                media_dir.mkdir(parents=True, exist_ok=True)
-
-                for att in attachments:
-                    try:
-                        # Get attachment properties
-                        url = getattr(att, 'url', '')
-                        content_type = getattr(att, 'content_type', '')
-                        filename = getattr(att, 'filename', '')
-
-                        # Debug: log attachment details
-                        logger.debug("Attachment - url: {}, content_type: {}, filename: {}", url, content_type, filename)
-
-                        if not url:
-                            logger.warning("Attachment has no URL: {}", att)
-                            continue
-
-                        # Determine media type and extension
-                        if 'image' in content_type or any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                            media_type = "image"
-                            ext = self._get_safe_extension(url, content_type) or ".jpg"
-                        elif 'audio' in content_type or 'voice' in content_type or any(url.lower().endswith(ext) for ext in ['.mp3', '.ogg', '.wav', '.m4a']):
-                            media_type = "voice"
-                            ext = self._get_safe_extension(url, content_type) or ".ogg"
-                        elif 'video' in content_type or any(url.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mov']):
-                            media_type = "video"
-                            ext = self._get_safe_extension(url, content_type) or ".mp4"
-                        else:
-                            media_type = "file"
-                            ext = self._get_safe_extension(url, content_type) or ""
-
-                        # Generate safe filename using hash of URL
-                        url_hash = hashlib.md5(url.encode()).hexdigest()[:16]
-                        file_path = media_dir / f"{url_hash}{ext}"
-
-                        async with httpx.AsyncClient() as client:
-                            response = await client.get(url, timeout=30.0)
-                            response.raise_for_status()
-                            file_path.write_bytes(response.content)
-
-                        media_paths.append(str(file_path))
-                        logger.info("Downloaded {} to {}", media_type, file_path)
-
-                        # Add media description to content
-                        if content:
-                            content += f" [{media_type}: {file_path}]"
-                        else:
-                            content = f"[{media_type}: {file_path}]"
-
-                    except Exception as e:
-                        logger.error("Failed to download attachment: {}", e)
-                        # Add error description to content
-                        if content:
-                            content += f" [{media_type}: download failed]"
-                        else:
-                            content = f"[{media_type}: download failed]"
-
-            # Skip if no content and no media
             if not content:
                 return
 
+            if is_group:
+                chat_id = data.group_openid
+                user_id = data.author.member_openid
+                self._chat_type_cache[chat_id] = "group"
+            else:
+                chat_id = str(getattr(data.author, 'id', None) or getattr(data.author, 'user_openid', 'unknown'))
+                user_id = chat_id
+                self._chat_type_cache[chat_id] = "c2c"
+
             await self._handle_message(
                 sender_id=user_id,
-                chat_id=user_id,
+                chat_id=chat_id,
                 content=content,
-                media=media_paths,
                 metadata={"message_id": data.id},
             )
         except Exception:
             logger.exception("Error handling QQ message")
-
-    @staticmethod
-    def _get_safe_extension(url: str, content_type: str) -> str:
-        """Extract safe file extension from URL or content_type."""
-        # Try to get from content_type first
-        ext_map = {
-            "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-            "image/png": ".png",
-            "image/gif": ".gif",
-            "image/webp": ".webp",
-            "audio/ogg": ".ogg",
-            "audio/mpeg": ".mp3",
-            "audio/mp4": ".m4a",
-            "audio/amr": ".amr",
-            "video/mp4": ".mp4",
-            "voice": ".amr",  # QQ voice messages use AMR format
-        }
-        if content_type in ext_map:
-            return ext_map[content_type]
-
-        # Try to extract from URL
-        try:
-            path = url.split('?')[0]  # Remove query params
-            path = path.split('/')[-1]  # Get filename only
-            if '.' in path:
-                ext = '.' + path.rsplit('.', 1)[-1].lower()
-                # Ensure extension is safe (no path separators, reasonable length)
-                if '/' not in ext and '\\' not in ext and len(ext) <= 10:
-                    return ext
-        except Exception:
-            pass
-        return ""
